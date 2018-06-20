@@ -30,7 +30,7 @@ aws:
 
 ### Command line argument
 ```
-java -jar kibana-proxy-0.0.1.jar
+java -jar aws-signature-proxy-0.0.1.jar
 ```
 if you are using a MFA, don't forget to change the mfacode in the application.yml first.
 The credentials will be valid for two hours after which you will have to restart the proxy. 
