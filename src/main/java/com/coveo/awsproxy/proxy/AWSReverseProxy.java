@@ -119,6 +119,8 @@ public class AWSReverseProxy
             if (ex.getResponseContent() != null) {
                 response.getOutputStream().write(ex.getResponseContent());
             }
+
+            response.setStatus(ex.getHttpResponse().getStatusCode());
         }
     }
 
