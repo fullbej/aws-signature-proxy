@@ -111,6 +111,7 @@ public class AWSReverseProxy
         } catch (AWSResponseException ex) {
             // Some unexpected error occured. Forward headers and content to caller.
             logger.info("Got an error response. {}", ex.getDisplayableString());
+            response.setStatus(ex.getHttpResponse().getStatusCode());
             if (ex.getHttpResponse().getHeaders() != null) {
                 for (Map.Entry<String, String> entry : ex.getHttpResponse().getHeaders().entrySet()) {
                     response.setHeader(entry.getKey(), entry.getValue());
@@ -119,8 +120,6 @@ public class AWSReverseProxy
             if (ex.getResponseContent() != null) {
                 response.getOutputStream().write(ex.getResponseContent());
             }
-
-            response.setStatus(ex.getHttpResponse().getStatusCode());
         }
     }
 
