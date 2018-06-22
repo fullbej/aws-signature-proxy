@@ -7,7 +7,7 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
-import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Enumeration;
 import java.util.HashMap;
@@ -21,8 +21,6 @@ import javax.servlet.http.HttpServletResponse;
 import org.apache.commons.io.IOUtils;
 import org.apache.http.NameValuePair;
 import org.apache.http.client.utils.URLEncodedUtils;
-import org.apache.http.entity.ContentType;
-import org.apache.http.entity.InputStreamEntity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -40,6 +38,7 @@ import com.amazonaws.auth.BasicSessionCredentials;
 import com.amazonaws.http.AmazonHttpClient;
 import com.amazonaws.http.ExecutionContext;
 import com.amazonaws.http.HttpMethodName;
+import com.amazonaws.http.HttpResponse;
 import com.coveo.awsproxy.domain.exception.AWSResponseException;
 import com.coveo.awsproxy.domain.exception.CouldNotGetSessionCredentialsException;
 import com.coveo.awsproxy.token.AWSErrorResponseHandler;
@@ -71,6 +70,7 @@ public class AWSReverseProxy
     @Autowired
     private AWSSRoleSessionCredentialsRetriever AWSSRoleSessionCredentialsRetriever;
     private BasicSessionCredentials sessionCredentials;
+    private AmazonHttpClient amazonHttpClient = new AmazonHttpClient(new ClientConfiguration());
 
     @RequestMapping("/**")
     public void reverseProxy(HttpServletRequest request, HttpServletResponse response)
@@ -78,48 +78,44 @@ public class AWSReverseProxy
                 URISyntaxException
     {
         logger.info("Proxying request: {}", request.getRequestURI());
-        InputStreamEntity inputStreamEntity = getInputStreamEntity(request);
-
-        logger.debug("Got input stream entity.");
         Request<Void> signedRequest = buildSignedRequest(request.getMethod(),
-                                                         serviceEndpoint + request.getRequestURI(),
+                                                         new URI(serviceEndpoint + request.getRequestURI()),
                                                          request,
-                                                         inputStreamEntity,
                                                          serviceName);
 
         try {
-            Response<AmazonWebServiceResponse<byte[]>> awsResponse = new AmazonHttpClient(new ClientConfiguration()).requestExecutionBuilder()
-                                                                                                                    .errorResponseHandler(new AWSErrorResponseHandler())
-                                                                                                                    .executionContext(new ExecutionContext(true))
-                                                                                                                    .request(signedRequest)
-                                                                                                                    .execute(new AWSResponseHandler());
-            response.setStatus(awsResponse.getHttpResponse().getStatusCode());
-
-            // We pass along any header received by AWS to the caller.
-            if (awsResponse.getHttpResponse().getHeaders() != null) {
-                for (Map.Entry<String, String> entry : awsResponse.getHttpResponse().getHeaders().entrySet()) {
-                    response.setHeader(entry.getKey(), entry.getValue());
-                }
-            }
-
-            // We pass along any body received by AWS to the caller.
-            if (awsResponse.getAwsResponse().getResult() != null
-                    && awsResponse.getAwsResponse().getResult().length > 0) {
-                response.getOutputStream().write(awsResponse.getAwsResponse().getResult());
-            }
-
+            Response<AmazonWebServiceResponse<byte[]>> awsResponse = amazonHttpClient.requestExecutionBuilder()
+                                                                                     .errorResponseHandler(new AWSErrorResponseHandler())
+                                                                                     .executionContext(new ExecutionContext(true))
+                                                                                     .request(signedRequest)
+                                                                                     .execute(new AWSResponseHandler());
+            fillResponse(response, awsResponse.getHttpResponse(), awsResponse.getAwsResponse().getResult());
         } catch (AWSResponseException ex) {
-            // Some unexpected error occured. Forward headers and content to caller.
-            logger.info("Got an error response. {}", ex.getDisplayableString());
-            response.setStatus(ex.getHttpResponse().getStatusCode());
-            if (ex.getHttpResponse().getHeaders() != null) {
-                for (Map.Entry<String, String> entry : ex.getHttpResponse().getHeaders().entrySet()) {
-                    response.setHeader(entry.getKey(), entry.getValue());
-                }
+            // AWS http client will throw an exception for anything not 200.
+            // We have to set the http response on the exception to retrieve it.
+            logger.debug("Got a response <> 200: {}", ex.getDisplayableString());
+            fillResponse(response, ex.getHttpResponse(), ex.getResponseContent());
+        }
+    }
+
+    private void fillResponse(HttpServletResponse servletResponse, HttpResponse awsHttpResponse, byte[] body)
+            throws IOException
+    {
+        // Set status code first
+        servletResponse.setStatus(awsHttpResponse.getStatusCode());
+
+        // We pass along any header received by AWS to the caller.
+        if (awsHttpResponse.getHeaders() != null) {
+            for (Map.Entry<String, String> entry : awsHttpResponse.getHeaders().entrySet()) {
+                servletResponse.setHeader(entry.getKey(), entry.getValue());
             }
-            if (ex.getResponseContent() != null) {
-                response.getOutputStream().write(ex.getResponseContent());
-            }
+        }
+
+        // We pass along any body received by AWS to the caller.
+        // We have to do this step last because the response will be commited
+        // and we won't be able to change headers or code (sent first to remote)
+        if (body != null && body.length > 0) {
+            servletResponse.getOutputStream().write(body);
         }
     }
 
@@ -138,7 +134,7 @@ public class AWSReverseProxy
                 // Using MFA
                 sessionCredentials = AWSSRoleSessionCredentialsRetriever.getRoleSessionCredentialsWithMfa(roleArn,
                                                                                                           region,
-                                                                                                          "kibanaReverse",
+                                                                                                          "awssignatureproxy",
                                                                                                           mfaSerial,
                                                                                                           mfaCode,
                                                                                                           accessKey,
@@ -148,7 +144,7 @@ public class AWSReverseProxy
                 // NO MFA
                 sessionCredentials = AWSSRoleSessionCredentialsRetriever.getRoleSessionCredentials(roleArn,
                                                                                                    region,
-                                                                                                   "kibanaReverse",
+                                                                                                   "awssignatureproxy",
                                                                                                    accessKey,
                                                                                                    secretKey,
                                                                                                    7200);
@@ -162,35 +158,20 @@ public class AWSReverseProxy
         }
     }
 
-    private InputStreamEntity getInputStreamEntity(HttpServletRequest request) throws IOException
-    {
-        int contentLength = request.getContentLength();
-
-        ContentType contentType = null;
-        if (request.getContentType() != null) {
-            contentType = ContentType.parse(request.getContentType());
-        }
-
-        return new InputStreamEntity(request.getInputStream(), contentLength, contentType);
-    }
-
     private Request<Void> buildSignedRequest(String verb,
-                                             String uri,
+                                             URI fullTargetUri,
                                              HttpServletRequest servletRequest,
-                                             InputStreamEntity inputStreamEntity,
                                              String service)
             throws URISyntaxException,
                 IOException
     {
-        URI fullTargetUri = new URI(uri);
         Request<Void> awsRequest = new DefaultRequest<>(service);
         awsRequest.setEndpoint(new URI(fullTargetUri.getScheme(), fullTargetUri.getAuthority(), null, null));
 
         // We process query params to make sure we pass them along to AWS.
         if (servletRequest.getQueryString() != null) {
             Map<String, List<String>> parameters = new HashMap<>();
-            List<NameValuePair> params = URLEncodedUtils.parse(servletRequest.getQueryString(),
-                                                               Charset.forName("UTF-8"));
+            List<NameValuePair> params = URLEncodedUtils.parse(servletRequest.getQueryString(), StandardCharsets.UTF_8);
             for (NameValuePair param : params) {
                 parameters.put(param.getName(), Arrays.asList(param.getValue()));
             }
@@ -221,8 +202,8 @@ public class AWSReverseProxy
         }
 
         // Set the body if any
-        if (inputStreamEntity.getContent() != null) {
-            byte[] dataArray = IOUtils.toByteArray(inputStreamEntity.getContent());
+        if (servletRequest.getInputStream() != null) {
+            byte[] dataArray = IOUtils.toByteArray(servletRequest.getInputStream());
             awsRequest.setContent(new ByteArrayInputStream(dataArray));
         }
 
