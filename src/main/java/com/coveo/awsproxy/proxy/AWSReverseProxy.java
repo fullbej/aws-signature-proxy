@@ -13,6 +13,7 @@ import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 import javax.annotation.PostConstruct;
 import javax.servlet.http.HttpServletRequest;
@@ -34,7 +35,9 @@ import com.amazonaws.DefaultRequest;
 import com.amazonaws.Request;
 import com.amazonaws.Response;
 import com.amazonaws.auth.AWS4Signer;
+import com.amazonaws.auth.AWSStaticCredentialsProvider;
 import com.amazonaws.auth.BasicSessionCredentials;
+import com.amazonaws.auth.StaticSignerProvider;
 import com.amazonaws.http.AmazonHttpClient;
 import com.amazonaws.http.ExecutionContext;
 import com.amazonaws.http.HttpMethodName;
@@ -56,7 +59,7 @@ public class AWSReverseProxy
     private String accessKey;
     @Value("${aws.secretaccesskey}")
     private String secretKey;
-    @Value("${aws.mfaserial}")
+    @Value("${aws.mfaserial:}")
     private String mfaSerial;
     @Value("${aws.rolearn}")
     private String roleArn;
@@ -64,7 +67,7 @@ public class AWSReverseProxy
     private String serviceName;
     @Value("${aws.region}")
     private String region;
-    @Value("${aws.mfacode}")
+    @Value("${aws.mfacode:}")
     private String mfaCode;
 
     @Autowired
@@ -82,18 +85,28 @@ public class AWSReverseProxy
                                                          new URI(serviceEndpoint + request.getRequestURI()),
                                                          request,
                                                          serviceName);
+        AWS4Signer signer = new AWS4Signer(true);
+        signer.setRegionName(region);
+        signer.setServiceName(serviceName);
 
         try {
+            ExecutionContext executionContext = ExecutionContext.builder()
+                                                                .withSignerProvider(new StaticSignerProvider(signer))
+                                                                .build();
+            executionContext.setCredentialsProvider(new AWSStaticCredentialsProvider(sessionCredentials));
             Response<AmazonWebServiceResponse<byte[]>> awsResponse = amazonHttpClient.requestExecutionBuilder()
                                                                                      .errorResponseHandler(new AWSErrorResponseHandler())
-                                                                                     .executionContext(new ExecutionContext(true))
+                                                                                     .executionContext(executionContext)
                                                                                      .request(signedRequest)
                                                                                      .execute(new AWSResponseHandler());
             fillResponse(response, awsResponse.getHttpResponse(), awsResponse.getAwsResponse().getResult());
         } catch (AWSResponseException ex) {
             // AWS http client will throw an exception for anything not 200.
             // We have to set the http response on the exception to retrieve it.
-            logger.debug("Got a response <> 200: {}", ex.getDisplayableString());
+            //String errorResponse = ex.getResponseContent() == null ? "" : new String(ex.getResponseContent());
+            //logger.info("Got a response <> 200. code {}. response: {}",
+            //             ex.getHttpResponse().getStatusCode(),
+            //            errorResponse);
             fillResponse(response, ex.getHttpResponse(), ex.getResponseContent());
         }
     }
@@ -167,15 +180,14 @@ public class AWSReverseProxy
     {
         Request<Void> awsRequest = new DefaultRequest<>(service);
         awsRequest.setEndpoint(new URI(fullTargetUri.getScheme(), fullTargetUri.getAuthority(), null, null));
+        //awsRequest.setEndpoint(new URI(fullTargetUri + "?" + servletRequest.getQueryString()));
 
         // We process query params to make sure we pass them along to AWS.
         if (servletRequest.getQueryString() != null) {
-            Map<String, List<String>> parameters = new HashMap<>();
             List<NameValuePair> params = URLEncodedUtils.parse(servletRequest.getQueryString(), StandardCharsets.UTF_8);
             for (NameValuePair param : params) {
-                parameters.put(param.getName(), Arrays.asList(param.getValue()));
+                awsRequest.withParameter(param.getName(), param.getValue());
             }
-            awsRequest.setParameters(parameters);
         }
 
         // Set the request path properly.
@@ -201,17 +213,7 @@ public class AWSReverseProxy
                 awsRequest.setHttpMethod(HttpMethodName.GET);
         }
 
-        // Set the body if any
-        if (servletRequest.getInputStream() != null) {
-            byte[] dataArray = IOUtils.toByteArray(servletRequest.getInputStream());
-            awsRequest.setContent(new ByteArrayInputStream(dataArray));
-        }
-
-        // We sign the request so AWS will accept it.
-        AWS4Signer signer = new AWS4Signer(true);
-        signer.setRegionName(region);
-        signer.setServiceName(awsRequest.getServiceName());
-        signer.sign(awsRequest, sessionCredentials);
+        Map<String, String> headers = new HashMap<>();
 
         // Here we take all the headers sent by the caller and add them to the request.
         // Note that referer, content-length and host are discarted.
@@ -219,10 +221,27 @@ public class AWSReverseProxy
             Enumeration<String> headerNames = servletRequest.getHeaderNames();
             while (headerNames.hasMoreElements()) {
                 String headerName = headerNames.nextElement();
-                if (!headerName.toLowerCase().equals("referer") && !headerName.toLowerCase().equals("host")
-                        && !headerName.toLowerCase().equals("content-length")) {
-                    awsRequest.addHeader(headerName, servletRequest.getHeader(headerName));
-                }
+                headers.put(headerName, servletRequest.getHeader(headerName));
+            }
+        }
+        List<String> blacklistedHeaders = Arrays.asList("accept",
+                                                        "host",
+                                                        "referer",
+                                                        "content-length",
+                                                        "user-agent",
+                                                        "origin");
+        headers = headers.entrySet()
+                         .stream()
+                         .filter(entry -> !blacklistedHeaders.contains(entry.getKey()))
+                         .collect(Collectors.toMap(entry -> entry.getKey(), entry -> entry.getValue()));
+        awsRequest.getHeaders().putAll(headers);
+
+        // Set the body if any
+        if (servletRequest.getInputStream() != null) {
+            byte[] dataArray = IOUtils.toByteArray(servletRequest.getInputStream());
+            awsRequest.setContent(new ByteArrayInputStream(dataArray));
+            if (dataArray.length == 0) {
+                awsRequest.addHeader("Content-Type", "application/json");
             }
         }
 
