@@ -22,6 +22,7 @@ import javax.servlet.http.HttpServletResponse;
 import org.apache.commons.io.IOUtils;
 import org.apache.http.NameValuePair;
 import org.apache.http.client.utils.URLEncodedUtils;
+import org.apache.logging.log4j.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -61,14 +62,16 @@ public class AWSReverseProxy
     private String secretKey;
     @Value("${aws.mfaserial:}")
     private String mfaSerial;
-    @Value("${aws.rolearn}")
+    @Value("${aws.rolearn:}")
     private String roleArn;
     @Value("${aws.servicename}")
     private String serviceName;
-    @Value("${aws.region}")
+    @Value("${aws.region:}")
     private String region;
     @Value("${aws.mfacode:}")
     private String mfaCode;
+    @Value("${aws.sessiontoken:}")
+    private String sessionToken;
 
     @Autowired
     private AWSSRoleSessionCredentialsRetriever AWSSRoleSessionCredentialsRetriever;
@@ -143,7 +146,9 @@ public class AWSReverseProxy
         logger.info("accessKey: {}", accessKey);
         logger.info("secretKey: {}", "XXXX");
         try {
-            if (mfaSerial != null && mfaSerial.length() > 0 && mfaCode != null && mfaCode.length() > 0) {
+            if (Strings.isNotEmpty(sessionToken)) {
+                sessionCredentials = new BasicSessionCredentials(accessKey, secretKey, sessionToken);
+            } else if (mfaSerial != null && !mfaSerial.isEmpty() && mfaCode != null && !mfaCode.isEmpty()) {
                 // Using MFA
                 sessionCredentials = AWSSRoleSessionCredentialsRetriever.getRoleSessionCredentialsWithMfa(roleArn,
                                                                                                           region,
